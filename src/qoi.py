@@ -1,24 +1,27 @@
-import argparse
-import os
-import sys
+import argparse, os, sys
 from PIL import Image
 from dataclasses import dataclass, field
 from typing import Optional
 
-QOI_MAX_PIXELS = 400_000_000
+QOI_MAX_PIXELS   = 400_000_000
+HEADER_SIZE      = 14
+END_MARKER_SIZE  = 8
+QOI_OP_RUN       = 0xc0    # 1100 0000
+QOI_OP_INDEX     = 0x00    # 0000 0000
+QOI_OP_RGB       = 0xfe    # 1111 1110
+QOI_OP_DIFF      = 0x40    # 0100 0000
+QOI_OP_LUMA      = 0x80    # 1000 0000
+QOI_OP_RGBA      = 0xff    # 1111 1111
+QOI_MASK_2       = 0xc0    # 1100 0000
+QOI_MAGIC        = ord('q') << 24 | ord('o') << 16 | ord('i') << 8 | ord('f')
 
-HEADER_SIZE = 14
-END_MARKER_SIZE = 8
 
-QOI_MAGIC = ord('q') << 24 | ord('o') << 16 | ord('i') << 8 | ord('f')
+def panic(msg: str):
+    sys.stderr.write(f"ERROR: {msg}\n")
+    exit(1)
 
-QOI_OP_RUN = 0xc0     # 1100 0000
-QOI_OP_INDEX = 0x00   # 0000 0000
-QOI_OP_RGB = 0xfe     # 1111 1110
-QOI_OP_DIFF = 0x40    # 0100 0000
-QOI_OP_LUMA = 0x80    # 1000 0000
-QOI_OP_RGBA = 0xff    # 1111 1111
-QOI_MASK_2 = 0xc0     # 1100 0000
+
+def replace_ext(path, ext): return path[:path.rfind('.')] + ext
 
 
 @dataclass
@@ -29,18 +32,12 @@ class Pixel:
         self.px_bytes = bytearray((0, 0, 0, 255))
 
     def update(self, px_bytes: bytes):
-        n_channels = len(px_bytes)
+        n = len(px_bytes)
 
-        if n_channels not in (3, 4):
-            sys.stderr.write(
-                f"ERROR: Invalid number of channels {n_channels}. Value must be 3 for RGB and 4 for RGBA\n")
-            exit(1)
+        if n not in (3, 4):
+            panic(f"Invalid number of channels: {n}. Value must be 3 or 4")
 
-        self.px_bytes[0:n_channels] = px_bytes
-
-    def __str__(self) -> str:
-        r, g, b, a = self.px_bytes
-        return f"Pixel(r={r}, g={g}, b={b}, a={a})"
+        self.px_bytes[0:n] = px_bytes
 
     @property
     def bytes(self) -> bytes:
@@ -69,10 +66,6 @@ class Pixel:
 
 
 class ByteBuffer:
-    """
-    Initializes a byte writer with a given size
-    and provides methods to write bytes to it
-    """
     padding_len = 8
 
     def __init__(self, size: int):
@@ -81,45 +74,27 @@ class ByteBuffer:
         self.max_pos = len(self.bytes) - self.padding_len
 
     def write(self, byte: int):
-        """
-        Writes a byte to the buffer and increments the write position
-        """
         self.bytes[self.pos] = (byte % 256)
         self.pos += 1
 
     def output(self):
-        """
-        Returns the bytes written to the buffer up to the write position
-        """
         return self.bytes[0:self.pos]
 
     def write_32_bits(self, value: int):
-        """
-        Writes a 32 bit integer to the buffer
-        """
         self.write((0xff000000 & value) >> 0x18)  # 24 bits
         self.write((0x00ff0000 & value) >> 0x10)  # 16 bits
         self.write((0x0000ff00 & value) >> 0x08)  # 8 bits
         self.write((0x000000ff & value) >> 0x00)  # 0 bits
 
     def read_32_bits(self) -> int:
-        """
-        Reads a 32 bit integer from the buffer
-        """
         data = [self.read() for _ in range(4)]
         b1, b2, b3, b4 = data
         return b1 << 24 | b2 << 16 | b3 << 8 | b4
 
     def set_pos(self, pos: int):
-        """
-        Sets the write position to a given value
-        """
         self.pos = pos
 
     def read(self) -> Optional[int]:
-        """
-        Reads a byte from the buffer and increments the read position
-        """
         if self.pos >= self.max_pos:
             return None
 
@@ -128,21 +103,11 @@ class ByteBuffer:
         return byte
 
 
-def fileExists(path: str) -> bool:
-    return os.path.isfile(path)
-
-
-def replace_ext(path: str, ext: str) -> str:
-    return path[:path.rfind('.')] + ext
-
-
 def encode(img_bytes: bytes, width: int, height: int, alpha: bool, srgb: bool):
     total_size = width * height
 
     if total_size > QOI_MAX_PIXELS:
-        sys.stderr.write(
-            f"ERROR: Image is too large, max pixels is {QOI_MAX_PIXELS}\n")
-        exit(1)
+        panic(f"Image is too large, max pixels is {QOI_MAX_PIXELS}")
 
     channel = 4 if alpha else 3
     pixel_data = (img_bytes[i:i + channel]
@@ -161,7 +126,6 @@ def encode(img_bytes: bytes, width: int, height: int, alpha: bool, srgb: bool):
     buf.write(4 if alpha else 3)
     buf.write(0 if srgb else 1)
 
-    # Encode pixels
     run = 0
     prev_px_value = Pixel()
     px_value = Pixel()
@@ -220,7 +184,6 @@ def encode(img_bytes: bytes, width: int, height: int, alpha: bool, srgb: bool):
         buf.write(px_value.blue)
 
     # Write end marker
-    # 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x01
     for _ in range(7):
         buf.write(0)
     buf.write(1)
@@ -232,8 +195,7 @@ def encode_img(img: Image.Image, srgb: bool, out_path: str) -> None:
     w, h = img.size
 
     if img.mode not in ["RGB", "RGBA"]:
-        sys.stderr.write(f"ERROR: Unsupported image mode {img.mode}\n")
-        exit(1)
+        panic(f"Unsupported image mode {img.mode}")
 
     alpha = True if img.mode == "RGBA" else False
     bytes = img.tobytes()
@@ -252,8 +214,7 @@ def decode(file_bytes: bytes):
 
     header_magic = buf.read_32_bits()
     if header_magic != QOI_MAGIC:
-        sys.stderr.write("ERROR: Not a valid QOI file\n")
-        exit(1)
+        panic("Not a valid QOI file")
 
     w = buf.read_32_bits()
     h = buf.read_32_bits()
@@ -315,13 +276,8 @@ def decode(file_bytes: bytes):
         if (b1 & QOI_MASK_2) == QOI_OP_RUN:
             run = (b1 & 0x3f)
 
-    out = {
-        "width": w,
-        "height": h,
-        "channels": "RGBA" if channel == 4 else "RGB",
-        "colorspace": srgb,
-        "bytes": pixel_data
-    }
+    out = {"w": w, "h": h, "channel": "RGBA" if channel ==
+           4 else "RGB", "colorspace": srgb, "bytes": pixel_data}
 
     return out
 
@@ -329,37 +285,29 @@ def decode(file_bytes: bytes):
 def decode_to_img(img_bytes: bytes, out_path: str) -> None:
     out = decode(img_bytes)
 
-    size = (out["width"], out["height"])
-    img = Image.frombuffer(out["channels"], size, bytes(out["bytes"]), "raw")
+    size = (out["w"], out["h"])
+    img = Image.frombuffer(out["channel"], size, bytes(out["bytes"]), "raw")
     img.save(out_path, "png")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("file_path", default=None,
-                        help="Path to the file to encode/decode", type=str)
-    parser.add_argument("-e", "--encode", help="Encode a file",
-                        action="store_true", default=False)
-    parser.add_argument("-d", "--decode", help="Decode a file",
-                        action="store_true", default=False)
-
+    parser.add_argument("file_path", default=None, type=str)
+    parser.add_argument("-e", "--encode", action="store_true", default=False)
+    parser.add_argument("-d", "--decode", action="store_true", default=False)
     args = parser.parse_args()
 
     if args.file_path is None:
-        sys.stderr.write("ERROR: No file path provided\n")
-        exit(1)
+        panic("No file path provided")
 
-    if not fileExists(args.file_path):
-        sys.stderr.write("ERROR: File does not exist\n")
-        exit(1)
+    if not os.path.isfile(args.file_path):
+        panic(f"File {args.file_path} doesn't exist")
 
     if args.encode:
         try:
             img = Image.open(args.file_path)
         except Exception as e:
-            sys.stderr.write(
-                f"ERROR: Couldn't open the image {args.file_path}, {e}\n")
-            exit(1)
+            panic(f"Couldn't open the image {args.file_path}, {e}")
 
         out_path = replace_ext(args.file_path, ".qoi")
         encode_img(img, out_path, out_path)
