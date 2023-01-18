@@ -1,3 +1,5 @@
+# This file is based on @mathpn's work
+# https://github.com/mathpn/py-qoi
 import argparse, os, sys
 from PIL import Image
 from dataclasses import dataclass, field
