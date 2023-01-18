@@ -1,11 +1,9 @@
-# Heavily inspired, and based on:
-# https://github.com/mathpn/py-qoi
-
 import argparse
 import os
 import sys
 from PIL import Image
 from dataclasses import dataclass, field
+from typing import Optional
 
 QOI_MAX_PIXELS = 400_000_000
 
@@ -19,6 +17,8 @@ QOI_OP_INDEX = 0x00   # 0000 0000
 QOI_OP_RGB = 0xfe     # 1111 1110
 QOI_OP_DIFF = 0x40    # 0100 0000
 QOI_OP_LUMA = 0x80    # 1000 0000
+QOI_OP_RGBA = 0xff    # 1111 1111
+QOI_MASK_2 = 0xc0     # 1100 0000
 
 
 @dataclass
@@ -73,23 +73,25 @@ class ByteBuffer:
     Initializes a byte writer with a given size
     and provides methods to write bytes to it
     """
+    padding_len = 8
 
     def __init__(self, size: int):
         self.bytes = bytearray(size)
-        self.write_pos = 0
+        self.pos = 0
+        self.max_pos = len(self.bytes) - self.padding_len
 
     def write(self, byte: int):
         """
         Writes a byte to the buffer and increments the write position
         """
-        self.bytes[self.write_pos] = (byte % 256)
-        self.write_pos += 1
+        self.bytes[self.pos] = (byte % 256)
+        self.pos += 1
 
     def output(self):
         """
         Returns the bytes written to the buffer up to the write position
         """
-        return self.bytes[0:self.write_pos]
+        return self.bytes[0:self.pos]
 
     def write_32_bits(self, value: int):
         """
@@ -99,6 +101,31 @@ class ByteBuffer:
         self.write((0x00ff0000 & value) >> 0x10)  # 16 bits
         self.write((0x0000ff00 & value) >> 0x08)  # 8 bits
         self.write((0x000000ff & value) >> 0x00)  # 0 bits
+
+    def read_32_bits(self) -> int:
+        """
+        Reads a 32 bit integer from the buffer
+        """
+        data = [self.read() for _ in range(4)]
+        b1, b2, b3, b4 = data
+        return b1 << 24 | b2 << 16 | b3 << 8 | b4
+
+    def set_pos(self, pos: int):
+        """
+        Sets the write position to a given value
+        """
+        self.pos = pos
+
+    def read(self) -> Optional[int]:
+        """
+        Reads a byte from the buffer and increments the read position
+        """
+        if self.pos >= self.max_pos:
+            return None
+
+        byte = self.bytes[self.pos]
+        self.pos += 1
+        return byte
 
 
 def fileExists(path: str) -> bool:
@@ -217,6 +244,96 @@ def encode_img(img: Image.Image, srgb: bool, out_path: str) -> None:
         f.write(output)
 
 
+def decode(file_bytes: bytes):
+    buf = ByteBuffer(len(file_bytes))
+    for byte in file_bytes:
+        buf.write(byte)
+    buf.set_pos(0)
+
+    header_magic = buf.read_32_bits()
+    if header_magic != QOI_MAGIC:
+        sys.stderr.write("ERROR: Not a valid QOI file\n")
+        exit(1)
+
+    w = buf.read_32_bits()
+    h = buf.read_32_bits()
+    channel = buf.read()
+    srgb = buf.read()
+
+    hash_array = [Pixel() for _ in range(64)]
+    out_size = w * h * channel
+    pixel_data = bytearray(out_size)
+    px_value = Pixel()
+
+    run = 0
+
+    for i in range(-channel, out_size, channel):
+        index_pos = px_value.hash
+        hash_array[index_pos].update(px_value.bytes)
+
+        if i >= 0:
+            pixel_data[i:i + channel] = px_value.bytes
+
+        if run:
+            run -= 1
+            continue
+
+        b1 = buf.read()
+        if b1 is None:
+            break
+
+        if b1 == QOI_OP_RGB:
+            new_value = bytes((buf.read() for _ in range(3)))
+            px_value.update(new_value)
+            continue
+
+        if b1 == QOI_OP_RGBA:
+            new_value = bytes((buf.read() for _ in range(4)))
+            px_value.update(new_value)
+            continue
+
+        if (b1 & QOI_MASK_2) == QOI_OP_INDEX:
+            px_value.update(hash_array[b1].bytes)
+            continue
+
+        if (b1 & QOI_MASK_2) == QOI_OP_DIFF:
+            red = (px_value.red + ((b1 >> 4) & 0x03) - 2) % 256
+            green = (px_value.green + ((b1 >> 2) & 0x03) - 2) % 256
+            blue = (px_value.blue + (b1 & 0x03) - 2) % 256
+            px_value.update(bytes((red, green, blue)))
+            continue
+
+        if (b1 & QOI_MASK_2) == QOI_OP_LUMA:
+            b2 = buf.read()
+            vg = ((b1 & 0x3f) % 256) - 32
+            red = (px_value.red + vg - 8 + ((b2 >> 4) & 0x0f)) % 256
+            green = (px_value.green + vg) % 256
+            blue = (px_value.blue + vg - 8 + (b2 & 0x0f)) % 256
+            px_value.update(bytes((red, green, blue)))
+            continue
+
+        if (b1 & QOI_MASK_2) == QOI_OP_RUN:
+            run = (b1 & 0x3f)
+
+    out = {
+        "width": w,
+        "height": h,
+        "channels": "RGBA" if channel == 4 else "RGB",
+        "colorspace": srgb,
+        "bytes": pixel_data
+    }
+
+    return out
+
+
+def decode_to_img(img_bytes: bytes, out_path: str) -> None:
+    out = decode(img_bytes)
+
+    size = (out["width"], out["height"])
+    img = Image.frombuffer(out["channels"], size, bytes(out["bytes"]), "raw")
+    img.save(out_path, "png")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("file_path", default=None,
@@ -248,7 +365,11 @@ def main():
         encode_img(img, out_path, out_path)
 
     if args.decode:
-        pass
+        with open(args.file_path, "rb") as f:
+            file_bytes = f.read()
+
+        out_path = replace_ext(args.file_path, ".png")
+        decode_to_img(file_bytes, out_path)
 
 
 if __name__ == "__main__":
